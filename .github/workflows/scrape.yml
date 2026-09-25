@@ -1,0 +1,67 @@
+name: Kalapite to Temu
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_products:
+        description: "For a trial: number of product pages (0 = all)"
+        required: false
+        default: "0"
+      price_multiplier:
+        description: "Multiplier for the site's EUR price (1 = same price)"
+        required: false
+        default: "1"
+      stock_quantity:
+        description: "Committed quantity for in-stock items; verify before upload"
+        required: false
+        default: "100"
+      package_weight_g:
+        description: "Verified packed weight in grams; blank = leave empty"
+        required: false
+        default: ""
+      package_length_cm:
+        description: "Verified packed length in cm; blank = leave empty"
+        required: false
+        default: ""
+      package_width_cm:
+        description: "Verified packed width in cm; blank = leave empty"
+        required: false
+        default: ""
+      package_height_cm:
+        description: "Verified packed height in cm; blank = leave empty"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Scrape and build the Temu workbook
+        env:
+          MAX_PRODUCTS: ${{ inputs.max_products }}
+          PRICE_MULTIPLIER: ${{ inputs.price_multiplier }}
+          STOCK_QUANTITY: ${{ inputs.stock_quantity }}
+          PACKAGE_WEIGHT_G: ${{ inputs.package_weight_g }}
+          PACKAGE_LENGTH_CM: ${{ inputs.package_length_cm }}
+          PACKAGE_WIDTH_CM: ${{ inputs.package_width_cm }}
+          PACKAGE_HEIGHT_CM: ${{ inputs.package_height_cm }}
+        run: python scraper.py --template template.xlsx --output results/kalapite-temu.xlsx --report results/review.csv
+      - name: Upload the workbook and review report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kalapite-temu-results
+          path: results/
+          if-no-files-found: error
+          retention-days: 14
