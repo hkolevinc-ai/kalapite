@@ -16,7 +16,7 @@ on:
         required: false
         default: "100"
       package_weight_g:
-        description: "Verified packed weight in grams; blank = leave empty"
+        description: "Fallback grams when product weight is absent; blank = 1000"
         required: false
         default: ""
       package_length_cm:
