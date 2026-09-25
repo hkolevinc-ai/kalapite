@@ -131,7 +131,10 @@ class Client:
         r = self.session.get(url, timeout=(12, 35))
         self.last = time.monotonic()
         r.raise_for_status()
-        return BeautifulSoup(r.content, "html.parser")
+        # The site declares UTF-8, but some pages contain stray invalid bytes.
+        # Letting BeautifulSoup guess from the byte stream can turn the Bulgarian
+        # stock label into mojibake and incorrectly discard available products.
+        return BeautifulSoup(r.content.decode("utf-8", errors="replace"), "html.parser")
 
     def image_info(self, url: str) -> tuple[int, int, int]:
         with self.session.get(url, timeout=(8, 20), stream=True) as r:
@@ -292,7 +295,10 @@ def parse_product(soup: BeautifulSoup, url: str, source_category: str) -> tuple[
         description = " ".join(lines)
     else:
         description = ""
-    details = " ".join(f"{k}: {v}." for k, v in specs.items())
+    # Product pages may put a bundle promotion in a specification table.
+    # Keep factual specifications, but never copy those prices into Temu text.
+    details = " ".join(f"{k}: {v}." for k, v in specs.items()
+                       if not re.search(r"(?:цена|цената|цени|лв|€|\bEUR\b)", k + " " + v, re.I))
     description = tidy((description + " " + details))[:2000] or title
     imgs = []
     for a in info.select(".tb_system_product_images a[href]"):
@@ -360,11 +366,36 @@ def material_of(p: Product) -> str:
         ("алумини", "Aluminum"), ("дървесина", "Wood"), ("от дърво", "Wood"),
     ]
     result = next((v for k, v in choices if k in blob), "")
+    if (not result or result == "Polyurethane") and p.category == "39761":
+        # The category dropdown does not have plain Polyurethane; Plastic is
+        # the broad available polymer value used for the other polymer molds.
+        result = "Plastic"
+    if not result and p.category == "15539":
+        result = "Metal" if "магнези" in blob or "инструмент" in blob or "мала" in blob or "тупал" in blob else "Wood" if "дървена" in blob else "Other material"
     if p.category == "39761" and result not in {"Silicone", "Plastic", "Steel", "Aluminum", "Stainless Steel", "Wood", "Rubber", "Vulcanized Rubber", "Fiberglass"}:
         return ""
     if p.category in {"15539", "15627"} and result == "Silicone":
         return ""
     return result
+
+
+WEIGHT_RE = re.compile(
+    r"тегло(?:\s+на\s+[^:.,]{1,30})?\s*[:\-]?\s*(\d+(?:[.,]\d+)?)\s*(кг|кg|kg|гр|gr|г|g)\b",
+    re.I,
+)
+
+
+def product_weight_g(description: str) -> int | None:
+    """Use the stated product/set weight, preferring the last summary weight."""
+    matches = WEIGHT_RE.findall(description)
+    if not matches:
+        return None
+    number, unit = matches[-1]
+    weight = Decimal(number.replace(",", "."))
+    if unit.casefold() in {"кг", "кg", "kg"}:
+        weight *= 1000
+    grams = int(weight.to_integral_value(rounding=ROUND_HALF_UP))
+    return grams if grams > 0 else None
 
 
 def product_code(sku: str, url: str) -> str:
@@ -379,16 +410,18 @@ def rows_for(p: Product, args: argparse.Namespace, issues: list[dict], seen_code
         base += "-" + hashlib.sha1(p.url.encode()).hexdigest()[:7].upper()
     seen_codes.add(base)
     source_maker = p.manufacturer.casefold()
-    manufacturer = args.manufacturer if source_maker in ("ilstart", "илстарт") else ""
+    manufacturer = args.manufacturer  # Valid dropdown value in this Temu template.
     material = material_of(p)
-    if not manufacturer:
-        issues.append(issue("MANUFACTURER_REVIEW", p.url, f"Производител на сайта: {p.manufacturer or 'липсва'}", p.sku))
+    if source_maker not in ("ilstart", "илстарт"):
+        issues.append(issue("MANUFACTURER_ASSUMED", p.url, f"Ilstart попълнен по инструкция; производител на сайта: {p.manufacturer or 'липсва'}", p.sku))
     if not material:
         issues.append(issue("MATERIAL_REVIEW", p.url, "Няма сигурна допустима стойност за материала", p.sku))
     if not p.stock_verified:
         issues.append(issue("STOCK_UNVERIFIED", p.url, "Има бутон за покупка, но липсва изрична наличност", p.sku))
-    if p.has_price_notes:
-        issues.append(issue("PRICE_DESCRIPTION_REVIEW", p.url, "Проверете цените на комплектите в описанието", p.sku))
+    stated_weight_g = product_weight_g(p.description)
+    weight_g = stated_weight_g or args.package_weight_g or 1000
+    if stated_weight_g is None and not args.package_weight_g:
+        issues.append(issue("WEIGHT_DEFAULT_1KG", p.url, "Няма посочено тегло; зададено е 1 kg", p.sku))
     if not all((args.package_weight_g, args.package_length_cm, args.package_width_cm, args.package_height_cm)):
         issues.append(issue("PACKAGE_DATA", p.url, "Проверете тегло и размери на опакован продукт", p.sku))
     issues.append(issue("STOCK_AND_ORIGIN", p.url, "Потвърдете реална наличност и държава на произход", p.sku))
@@ -422,8 +455,7 @@ def rows_for(p: Product, args: argparse.Namespace, issues: list[dict], seen_code
             record["HO"] = amount(p.list_price * args.price_multiplier)
         else:
             record["HP"] = "N/A"
-        if args.package_weight_g:
-            record["HQ"] = args.package_weight_g
+        record["HQ"] = weight_g
         for c, value in zip(("HR", "HS", "HT"), (args.package_length_cm, args.package_width_cm, args.package_height_cm)):
             if value:
                 record[c] = value
