@@ -131,10 +131,7 @@ class Client:
         r = self.session.get(url, timeout=(12, 35))
         self.last = time.monotonic()
         r.raise_for_status()
-        # The site declares UTF-8, but some pages contain stray invalid bytes.
-        # Letting BeautifulSoup guess from the byte stream can turn the Bulgarian
-        # stock label into mojibake and incorrectly discard available products.
-        return BeautifulSoup(r.content.decode("utf-8", errors="replace"), "html.parser")
+        return BeautifulSoup(r.content, "html.parser")
 
     def image_info(self, url: str) -> tuple[int, int, int]:
         with self.session.get(url, timeout=(8, 20), stream=True) as r:
