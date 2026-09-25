@@ -36,13 +36,23 @@ CAPACITY = 5000
 HEADER_ROW = 4
 START_ROW = 5
 BAD_CATEGORY = re.compile(
-    r"оцветител|оксидни-бои|/добавки|консуматив|продукти-от-щампован-бетон|под-наем",
+    r"/(?:оцветители|оксидни-бои|добавки|консумативи-за-щампован-бетон|продукти-от-щампован-бетон(?:-1)?|калъпи-под-наем)(?:/|$)",
     re.I,
 )
 BAD_PRODUCT = re.compile(r"(лак за|пигмент|боя за|разредител|втвърдител|добавка за)", re.I)
 NON_PRODUCT_TEXT = (
     "Стоки на обща стойност", "След като добавите продуктите", "Артикулът се изпраща",
 )
+
+
+def clean_description_line(raw: str) -> str:
+    text = tidy(raw)
+    for stop in NON_PRODUCT_TEXT:
+        if stop in text:
+            text = text.split(stop, 1)[0]
+    sentences = re.split(r"(?<=[.!?])\s+(?=[А-ЯA-Z])", text)
+    return tidy(" ".join(s for s in sentences if not re.search(
+        r"\b(?:цена|цената|цени|плащане|кредит)\b|лв|€|при поръчка през сайта", s, re.I)))
 
 
 def tidy(s: str) -> str:
@@ -211,6 +221,8 @@ class Product:
     specs: dict[str, str]
     images: list[str]
     variants: list[tuple[str, str, Decimal]] = field(default_factory=list)
+    stock_verified: bool = True
+    has_price_notes: bool = False
 
 
 def parse_product(soup: BeautifulSoup, url: str, source_category: str) -> tuple[Product | None, str]:
@@ -229,10 +241,29 @@ def parse_product(soup: BeautifulSoup, url: str, source_category: str) -> tuple[
             if dd:
                 facts[tidy(dt.get_text(" ", strip=True)).rstrip(":")] = tidy(dd.get_text(" ", strip=True))
     status = facts.get("Наличност", "")
-    if status and "в наличност" not in status.lower():
-        return None, "Не е в наличност: " + status
     if not status:
-        return None, "Не е обявена наличност"
+        marker = info.select_one(".tb_stock_status_in_stock,.tb_stock_status_out_of_stock")
+        status = tidy(marker.get_text(" ", strip=True)) if marker else ""
+    if not status:
+        for tag in info.select('script[type="application/ld+json"]'):
+            try:
+                structured = json.loads(tag.string or tag.get_text())
+                offer = structured.get("offers", {}) if isinstance(structured, dict) else {}
+                if isinstance(offer, dict) and offer.get("availability"):
+                    status = str(offer["availability"])
+                    break
+            except (ValueError, TypeError):
+                pass
+    if status and "в наличност" not in status.lower() and "instock" not in status.lower():
+        return None, "Не е в наличност: " + status
+    stock_verified = bool(status)
+    if not status:
+        # Some product responses omit the stock widget. Keep the record only when
+        # the page explicitly presents a purchase button; mark stock unverified.
+        buy = next((b for b in info.select("button") if re.search(
+            r"Купи|Добави в количка", b.get_text(" ", strip=True), re.I)), None)
+        if buy is None or buy.has_attr("disabled"):
+            return None, "Не е обявена наличност и липсва активен бутон за покупка"
     sku = facts.get("Код на продукта", "")
     if not sku:
         return None, "Липсва код на продукта"
@@ -247,6 +278,8 @@ def parse_product(soup: BeautifulSoup, url: str, source_category: str) -> tuple[
 
     body = info.select_one(".tb_product_description")
     specs = {}
+    has_price_notes = bool(body and re.search(
+        r"\b(?:цена|цената|цени)\b.{0,80}(?:лв|€)", body.get_text(" ", strip=True), re.I))
     if body:
         for tr in body.select("tr"):
             tds = tr.find_all(["td", "th"], recursive=False)
@@ -254,8 +287,8 @@ def parse_product(soup: BeautifulSoup, url: str, source_category: str) -> tuple[
                 k, v = (tidy(x.get_text(" ", strip=True)) for x in tds[:2])
                 if k and v:
                     specs[k] = v
-        lines = [tidy(x.get_text(" ", strip=True)) for x in body.find_all("p")]
-        lines = [x for x in lines if x and not any(x.startswith(a) for a in NON_PRODUCT_TEXT)]
+        lines = [clean_description_line(x.get_text(" ", strip=True)) for x in body.find_all("p")]
+        lines = [x for x in lines if x]
         description = " ".join(lines)
     else:
         description = ""
@@ -303,7 +336,8 @@ def parse_product(soup: BeautifulSoup, url: str, source_category: str) -> tuple[
         if not variants or len(variants) > 30:
             return None, "Неподдържан брой покупни варианти"
     return Product(url, source_category, category, title, sku, price, list_price,
-                   facts.get("Производители", ""), description, specs, imgs[:10], variants), ""
+                   facts.get("Производители", ""), description, specs, imgs[:10], variants,
+                   stock_verified, has_price_notes), ""
 
 
 def issue(kind: str, url: str, message: str, sku: str = "", row: int | str = "") -> dict:
@@ -311,16 +345,22 @@ def issue(kind: str, url: str, message: str, sku: str = "", row: int | str = "")
 
 
 def material_of(p: Product) -> str:
+    source = unquote(urlsplit(p.source_category).path).lower()
     blob = (p.description + " " + p.title).lower()
+    if "калъпи-от-гума" in source:
+        return "Vulcanized Rubber" if "вулканизац" in blob else "Rubber"
+    if "калъпи-от-стъклопласт" in source:
+        return "Fiberglass"
     choices = [
         ("силикон", "Silicone"), ("стъклопласт", "Fiberglass"),
+        ("вулканизирана гума", "Vulcanized Rubber"), ("гума", "Rubber"),
         ("полиуретан", "Polyurethane"), ("полипропилен", "Plastic"),
         ("abs", "Plastic"), ("абс", "Plastic"), ("пластмас", "Plastic"),
         ("неръждаема стомана", "Stainless Steel"), ("стомана", "Steel"),
-        ("алумини", "Aluminum"), ("дърво", "Wood"),
+        ("алумини", "Aluminum"), ("дървесина", "Wood"), ("от дърво", "Wood"),
     ]
     result = next((v for k, v in choices if k in blob), "")
-    if p.category == "39761" and result not in {"Silicone", "Plastic", "Steel", "Aluminum", "Stainless Steel", "Wood"}:
+    if p.category == "39761" and result not in {"Silicone", "Plastic", "Steel", "Aluminum", "Stainless Steel", "Wood", "Rubber", "Vulcanized Rubber", "Fiberglass"}:
         return ""
     if p.category in {"15539", "15627"} and result == "Silicone":
         return ""
@@ -345,6 +385,10 @@ def rows_for(p: Product, args: argparse.Namespace, issues: list[dict], seen_code
         issues.append(issue("MANUFACTURER_REVIEW", p.url, f"Производител на сайта: {p.manufacturer or 'липсва'}", p.sku))
     if not material:
         issues.append(issue("MATERIAL_REVIEW", p.url, "Няма сигурна допустима стойност за материала", p.sku))
+    if not p.stock_verified:
+        issues.append(issue("STOCK_UNVERIFIED", p.url, "Има бутон за покупка, но липсва изрична наличност", p.sku))
+    if p.has_price_notes:
+        issues.append(issue("PRICE_DESCRIPTION_REVIEW", p.url, "Проверете цените на комплектите в описанието", p.sku))
     if not all((args.package_weight_g, args.package_length_cm, args.package_width_cm, args.package_height_cm)):
         issues.append(issue("PACKAGE_DATA", p.url, "Проверете тегло и размери на опакован продукт", p.sku))
     issues.append(issue("STOCK_AND_ORIGIN", p.url, "Потвърдете реална наличност и държава на произход", p.sku))
@@ -538,7 +582,10 @@ def main():
                 issues.append(issue("IMAGE_TOO_SMALL_OR_WRONG_FORMAT", url,
                                     f"Основна снимка {width}x{height}px, {nbytes} bytes; Temu иска квадрат ≥800x800px и ≤3MB",
                                     product.sku))
-        except (requests.RequestException, ValueError, OSError) as exc:
+        except ValueError as exc:
+            label = "IMAGE_TOO_LARGE" if "exceeds 3 MB" in str(exc) else "IMAGE_UNVERIFIED"
+            issues.append(issue(label, url, str(exc), product.sku))
+        except (requests.RequestException, OSError) as exc:
             issues.append(issue("IMAGE_UNVERIFIED", url, f"Снимката не можа да се провери: {exc}", product.sku))
         first_row = START_ROW + len(records)
         new_records = rows_for(product, args, issues, seen_codes)
